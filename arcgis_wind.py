@@ -8,7 +8,7 @@ import re
 import shutil
 from tempfile import TemporaryDirectory
 from time import sleep
-from urllib.error import HTTPError
+from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 from uuid import uuid4
@@ -26,7 +26,12 @@ SHARING_GROUPS = ""  # Comma-separated Portal group names, if needed.
 
 
 NOMADS = "https://nomads.ncep.noaa.gov/cgi-bin/filter_gfs_0p25.pl"
+GFS_ARCHIVE = "https://noaa-gfs-bdp-pds.s3.amazonaws.com"
 GRID_SIZE = [1440, 721]
+
+
+class WindInputError(ValueError):
+    """The source did not provide a usable global 10 m wind GRIB2."""
 
 
 def cycle_candidates(explicit_cycle):
@@ -55,9 +60,80 @@ def download_grib(cycle, destination):
     with urlopen(request, timeout=60) as response, destination.open("wb") as output:
         signature = response.read(4)
         if signature != b"GRIB":
-            raise ValueError("NOMADS returned a response without a GRIB signature.")
+            raise WindInputError("NOMADS returned a response without a GRIB signature.")
         output.write(signature)
         shutil.copyfileobj(response, output)
+
+
+def archive_ranges(index_text):
+    offsets = set()
+    matches = {"UGRD": set(), "VGRD": set()}
+    for line in index_text.splitlines():
+        fields = line.split(":", 5)
+        if len(fields) < 5 or not fields[1].isdigit():
+            continue
+        offset = int(fields[1])
+        offsets.add(offset)
+        variable, level = fields[3].strip(), fields[4].strip()
+        if level == "10 m above ground" and variable in matches:
+            matches[variable].add(offset)
+
+    if any(len(found) != 1 for found in matches.values()):
+        raise WindInputError("The NOAA archive index must contain one 10 m UGRD and one VGRD record.")
+    ordered = sorted(offsets)
+    next_offsets = dict(zip(ordered, ordered[1:]))
+    for start in sorted(matches["UGRD"] | matches["VGRD"]):
+        yield start, next_offsets.get(start)
+
+
+def download_archive_grib(cycle, destination):
+    key = cycle.strftime("gfs.%Y%m%d/%H/atmos/gfs.t%Hz.pgrb2.0p25.f000")
+    url = f"{GFS_ARCHIVE}/{key}"
+    with urlopen(url + ".idx", timeout=60) as response:
+        ranges = list(archive_ranges(response.read().decode("ascii")))
+
+    with destination.open("wb") as output:
+        for start, next_start in ranges:
+            end = next_start - 1 if next_start is not None else None
+            range_end = str(end) if end is not None else ""
+            request = Request(url, headers={"Range": f"bytes={start}-{range_end}"})
+            with urlopen(request, timeout=60) as response:
+                if response.status != 206:
+                    raise WindInputError("The NOAA archive did not return the requested byte range (HTTP 206).")
+                returned = re.fullmatch(r"bytes (\d+)-(\d+)/(\d+)", response.headers.get("Content-Range", ""))
+                if returned is None:
+                    raise WindInputError("The NOAA archive response is missing a valid Content-Range header.")
+                actual_start, actual_end, total = map(int, returned.groups())
+                if actual_start != start or actual_end != (end if end is not None else total - 1):
+                    raise WindInputError("The NOAA archive returned a different byte range than requested.")
+                record = response.read()
+                if not record.startswith(b"GRIB") or len(record) != actual_end - actual_start + 1:
+                    raise WindInputError("The NOAA archive returned an invalid or incomplete GRIB2 record.")
+                output.write(record)
+
+
+def grib_header_size(path):
+    """Read the dimensions from the first GRIB2 grid definition for diagnostics."""
+    with path.open("rb") as stream:
+        header = stream.read(16)
+        if len(header) != 16 or header[:4] != b"GRIB" or header[7] != 2:
+            return None
+        message_size = int.from_bytes(header[8:16], "big")
+        while stream.tell() + 5 < message_size:
+            section_start = stream.tell()
+            prefix = stream.read(5)
+            if len(prefix) != 5:
+                break
+            length = int.from_bytes(prefix[:4], "big")
+            if length < 5 or section_start + length > message_size:
+                break
+            if prefix[4] == 3 and length >= 38:
+                definition = prefix + stream.read(33)
+                if len(definition) == 38 and definition[12:14] == b"\x00\x00":
+                    return [int.from_bytes(definition[offset:offset + 4], "big") for offset in (30, 34)]
+                break
+            stream.seek(section_start + length)
+    return None
 
 
 def wind_bands(info, cycle):
@@ -92,28 +168,51 @@ def wind_bands(info, cycle):
     return selected["UGRD"], selected["VGRD"]
 
 
-def read_raster_info(gdal, path):
-    info = gdal.Info(str(path), format="json")
+def read_raster_info(gdal, dataset):
+    info = gdal.Info(dataset, format="json")
     return json.loads(info) if isinstance(info, str) else info
 
 
 def verify_tiff(gdal, path, cycle):
-    info = read_raster_info(gdal, path)
-    types = [band["type"] for band in info["bands"]]
-    if wind_bands(info, cycle) != (1, 2) or types != ["Float32", "Float32"]:
-        raise ValueError("The GeoTIFF must contain two Float32 bands ordered U, V.")
+    try:
+        dataset = gdal.OpenEx(str(path), gdal.OF_RASTER, allowed_drivers=["GTiff"])
+        info = read_raster_info(gdal, dataset)
+        types = [band["type"] for band in info["bands"]]
+        if wind_bands(info, cycle) != (1, 2) or types != ["Float32", "Float32"]:
+            raise ValueError("Expected two Float32 bands ordered U, V.")
+    except (RuntimeError, ValueError) as error:
+        raise ValueError(f"GeoTIFF {path}: {error}") from error
 
 
 def convert_grib(gdal, grib, output, cycle):
     with gdal.ExceptionMgr(), gdal.config_option("GRIB_ADJUST_LONGITUDE_RANGE", "YES"):
-        u_band, v_band = wind_bands(read_raster_info(gdal, grib), cycle)
+        try:
+            source = gdal.OpenEx(str(grib), gdal.OF_RASTER, allowed_drivers=["GRIB"])
+            u_band, v_band = wind_bands(read_raster_info(gdal, source), cycle)
+        except (RuntimeError, ValueError) as error:
+            header_size = grib_header_size(grib) if grib.is_file() else None
+            raise WindInputError(f"Input GRIB2 {grib.name} (raw grid: {header_size}): {error}") from error
         raster = gdal.Translate(
-            str(output), str(grib), format="GTiff",
+            str(output), source, format="GTiff",
             bandList=[u_band, v_band], outputType=gdal.GDT_Float32,
             outputSRS="EPSG:4326", creationOptions=["COMPRESS=DEFLATE"],
         )
         raster = None  # Close and flush GDAL's output before ArcPy opens it.
         verify_tiff(gdal, output, cycle)
+
+
+def fetch_global_wind(arcpy, gdal, cycle, grib, output):
+    try:
+        download_grib(cycle, grib)
+        convert_grib(gdal, grib, output, cycle)
+        return
+    except (WindInputError, URLError, TimeoutError) as error:
+        if isinstance(error, HTTPError) and error.code == 404:
+            raise
+        arcpy.AddWarning(f"NOMADS {cycle.isoformat()}: {error} Trying NOAA's Open Data archive.")
+
+    download_archive_grib(cycle, grib)
+    convert_grib(gdal, grib, output, cycle)
 
 
 def prepare_wind(output_dir, *, cycle=None, grib_file=None):
@@ -136,26 +235,37 @@ def prepare_wind(output_dir, *, cycle=None, grib_file=None):
     for index, model_time in enumerate(cycles):
         name = model_time.strftime("wind_10m_%Y%m%d%HZ.tif")
         output = output_dir / name
-        if output.exists() and not grib_file:
-            with gdal.ExceptionMgr():
-                verify_tiff(gdal, output, model_time)
-            return output, model_time
+        if output.exists():
+            try:
+                with gdal.ExceptionMgr():
+                    verify_tiff(gdal, output, model_time)
+            except ValueError as error:
+                output = output.with_stem(output.stem + "_global")
+                arcpy.AddWarning(f"{error} Using {output.name} for the replacement raster.")
+            else:
+                if not grib_file:
+                    return output, model_time
+            if output.exists() and not grib_file:
+                with gdal.ExceptionMgr():
+                    verify_tiff(gdal, output, model_time)
+                return output, model_time
 
         with TemporaryDirectory(prefix="gfs-stage-", dir=output_dir) as temp_dir:
             stage = Path(temp_dir)
             grib = Path(grib_file) if grib_file else stage / "wind.grib2"
-            if not grib_file:
+            staged_tif = stage / output.name
+            if grib_file:
+                convert_grib(gdal, grib, staged_tif, model_time)
+            else:
                 arcpy.AddMessage(f"Checking NOAA GFS {model_time.isoformat()}")
                 try:
-                    download_grib(model_time, grib)
+                    fetch_global_wind(arcpy, gdal, model_time, grib, staged_tif)
                 except HTTPError as error:
                     if error.code != 404 or index == len(cycles) - 1:
                         raise
                     sleep(10)
                     continue
 
-            staged_tif = stage / name
-            convert_grib(gdal, grib, staged_tif, model_time)
             if output.exists():
                 with gdal.ExceptionMgr():
                     verify_tiff(gdal, output, model_time)
