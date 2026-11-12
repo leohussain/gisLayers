@@ -1,5 +1,7 @@
+
 """Build and publish the NOAA GFS 10 m wind layer from ArcGIS Pro Python."""
 
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 import json
 from math import isclose
@@ -311,30 +313,68 @@ def native_wind_messages(path, cycle):
     return wind
 
 
-def arcpy_wind_array(arcpy, np, path, component):
+@contextmanager
+def temporary_wind_stage(arcpy, parent, prefix):
+    temporary = TemporaryDirectory(prefix=prefix, dir=parent, ignore_cleanup_errors=True)
+    folder = Path(temporary.name)
+    try:
+        yield folder
+    finally:
+        temporary.cleanup()
+        if folder.exists():
+            try:
+                arcpy.management.ClearWorkspaceCache(str(folder))
+            except (arcpy.ExecuteError, RuntimeError, OSError) as error:
+                arcpy.AddWarning(f"Could not clear the ArcGIS workspace cache for {folder}: {error}")
+            temporary.cleanup()
+            if folder.exists():
+                arcpy.AddWarning(f"ArcGIS could not remove temporary files in {folder}. They can be removed after Pro closes.")
+
+
+def arcpy_wind_array(arcpy, gdal, np, path, component):
+    tiff = path.with_suffix(".tif")
     layer = arcpy.md.MakeMultidimensionalRasterLayer(
         str(path), f"wind_{component.lower()}_{uuid4().hex}", dimensionless="NO_DIMENSIONS",
     ).getOutput(0)
     try:
-        raster = arcpy.Raster(layer)
-        try:
-            values = np.asarray(arcpy.RasterToNumPyArray(raster, nodata_to_value=WIND_NODATA),
-                                dtype=np.float32).squeeze()
-            dx, dy = raster.meanCellWidth, raster.meanCellHeight
-            longitude = raster.extent.XMin + dx / 2
-            latitude = raster.extent.YMax - dy / 2
-        finally:
-            del raster
+        arcpy.management.CopyRaster(layer, str(tiff), pixel_type="32_BIT_FLOAT", format="TIFF")
     finally:
-        arcpy.management.Delete(layer)
-    if values.shape != (GRID_SIZE[1], GRID_SIZE[0]):
-        raise WindInputError(f"ArcGIS read {component} as {values.shape} rows/columns; expected (721, 1440).")
+        try:
+            arcpy.management.Delete(layer)
+        except (arcpy.ExecuteError, RuntimeError, TypeError, OSError) as error:
+            arcpy.AddWarning(f"Could not delete the temporary ArcGIS layer for {component}: {error}")
+        finally:
+            del layer
+
+    with gdal.OpenEx(str(tiff), gdal.OF_RASTER, allowed_drivers=["GTiff"]) as raster:
+        shape = [raster.RasterXSize, raster.RasterYSize]
+        if shape != GRID_SIZE or raster.RasterCount != 1:
+            raise WindInputError(f"ArcGIS copied {component} as {shape} with {raster.RasterCount} bands; expected {GRID_SIZE} with one band.")
+        transform = raster.GetGeoTransform(can_return_null=True)
+        if transform is None:
+            raise WindInputError(f"ArcGIS copied {component} without a geographic grid transform.")
+        x0, dx, rx, y0, ry, dy = transform
+        band = raster.GetRasterBand(1)
+        try:
+            nodata = band.GetNoDataValue()
+            samples = band.ReadRaster(0, 0, *GRID_SIZE, buf_type=gdal.GDT_Float32)
+        finally:
+            del band
+
+    longitude, latitude = x0 + dx / 2, y0 + dy / 2
     if not all(isclose(actual, expected, abs_tol=1e-5)
-               for actual, expected in ((dx, 0.25), (dy, 0.25), (latitude, 90.0))):
-        raise WindInputError(f"ArcGIS read an unexpected {component} cell size or latitude extent.")
+               for actual, expected in ((dx, 0.25), (dy, -0.25), (rx, 0), (ry, 0), (latitude, 90.0))):
+        raise WindInputError(f"ArcGIS copied {component} with an unexpected grid transform: {transform}.")
     columns = (-180.0 - longitude) / dx
     if not isclose(columns, round(columns), abs_tol=1e-4):
         raise WindInputError(f"ArcGIS read {component} with a misaligned longitude grid starting at {longitude}Â°.")
+
+    values = np.frombuffer(samples, dtype=np.float32).reshape(GRID_SIZE[1], GRID_SIZE[0])
+    invalid = ~np.isfinite(values)
+    if nodata is not None:
+        invalid |= values == np.float32(nodata)
+    if invalid.any():
+        values = np.where(invalid, np.float32(WIND_NODATA), values)
     return np.roll(values, -round(columns) % GRID_SIZE[0], axis=1)
 
 
@@ -344,13 +384,13 @@ def convert_grib_with_arcpy(gdal, grib, output, cycle):
     from osgeo import osr
 
     fields = native_wind_messages(grib, cycle)
-    with TemporaryDirectory(prefix="wind-native-", dir=output.parent) as folder:
+    with temporary_wind_stage(arcpy, output.parent, "wind-native-") as folder:
         with arcpy.EnvManager(addOutputsToMap=False):
             arrays = []
             for component in ("UGRD", "VGRD"):
-                path = Path(folder) / f"{component}.grb2"
+                path = folder / f"{component}.grb2"
                 path.write_bytes(fields[component])
-                arrays.append(arcpy_wind_array(arcpy, np, path, component))
+                arrays.append(arcpy_wind_array(arcpy, gdal, np, path, component))
 
     timestamp = str(int(cycle.timestamp()))
     with gdal.GetDriverByName("GTiff").Create(
@@ -404,7 +444,7 @@ def convert_grib(gdal, grib, output, cycle):
             arcpy.AddWarning(f"{detail} Trying the ArcGIS Pro GRIB reader.")
             try:
                 convert_grib_with_arcpy(gdal, grib, output, cycle)
-            except (arcpy.ExecuteError, RuntimeError, ValueError, OSError) as native_error:
+            except (arcpy.ExecuteError, RuntimeError, TypeError, ValueError, OSError) as native_error:
                 raise WindInputError(f"{detail} ArcGIS Pro reader: {native_error}") from native_error
         verify_tiff(gdal, output, cycle)
 
@@ -459,8 +499,7 @@ def prepare_wind(output_dir, *, cycle=None, grib_file=None):
                     verify_tiff(gdal, output, model_time)
                 return output, model_time
 
-        with TemporaryDirectory(prefix="gfs-stage-", dir=output_dir) as temp_dir:
-            stage = Path(temp_dir)
+        with temporary_wind_stage(arcpy, output_dir, "gfs-stage-") as stage:
             grib = Path(grib_file) if grib_file else stage / "wind.grib2"
             staged_tif = stage / output.name
             if grib_file:
