@@ -1,0 +1,1 @@
+https://nomads.ncep.noaa.gov/cgi-bin/filter_gfs_0p25.pl?file=gfs.t00z.pgrb2.0p25.anl&lev_10_m_above_ground=on&lev_10_m_above_mean_sea_level=on&var_UGRD=on&var_VGRD=on&leftlon=0&rightlon=360&toplat=90&bottomlat=-90&dir=%2Fgfs.20261112%2F00%2Fatmos
