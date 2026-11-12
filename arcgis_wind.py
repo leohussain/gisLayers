@@ -1,10 +1,9 @@
-
 """Build and publish the NOAA GFS 10 m wind layer from ArcGIS Pro Python."""
 
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 import json
-from math import isclose
+from math import floor, isclose
 from pathlib import Path
 import re
 import shutil
@@ -193,18 +192,37 @@ def grib_header_size(path):
     return None
 
 
-def wind_bands(info, cycle):
-    if info.get("size") != GRID_SIZE:
-        raise ValueError(f"Expected the global 1440 x 721 grid, got {info.get('size')}.")
+def validate_exported_grid(size, transform):
+    if size not in (GRID_SIZE, [GRID_SIZE[0], GRID_SIZE[1] - 1]):
+        raise ValueError(f"Expected a global 1440 x 720 or 1440 x 721 raster, got {size}.")
+    if transform is None or len(transform) != 6:
+        raise ValueError("The raster has no geographic grid transform.")
 
-    transform = info.get("geoTransform", [])
-    if len(transform) != 6:
-        raise ValueError("The input has no six-value geographic grid transform.")
-    x0, dx, rx, y0, ry, dy = transform
-    expected = (-180.0, 0.25, 0.0, 90.0, 0.0, -0.25)
-    actual = (x0 + dx / 2, dx, rx, y0 + dy / 2, ry, dy)
-    if not all(isclose(a, b, abs_tol=1e-5) for a, b in zip(actual, expected)):
-        raise ValueError(f"Unexpected GFS grid after longitude normalisation: {transform}")
+    width, height = size
+    _, dx, rx, north, ry, dy = transform
+    south = north + height * dy
+    # ArcGIS can clip the polar edge cells when it copies the GRIB2 layer.
+    polar_tolerance = 0.125 + 1e-5
+    if not (isclose(dx * width, 360, abs_tol=1e-4)
+            and isclose(dy, -0.25, abs_tol=0.25 / height + 1e-5)
+            and isclose(rx, 0, abs_tol=1e-10) and isclose(ry, 0, abs_tol=1e-10)
+            and isclose(north, 90, abs_tol=polar_tolerance)
+            and isclose(south, -90, abs_tol=polar_tolerance)):
+        raise ValueError(f"Raster {size} does not cover the global quarter-degree grid: {transform}.")
+
+
+def wind_bands(info, cycle, *, exported=False):
+    size = info.get("size")
+    transform = info.get("geoTransform", ())
+    if exported:
+        validate_exported_grid(size, transform)
+        if not isclose(transform[0], -180.0, abs_tol=0.125 + 1e-5):
+            raise ValueError(f"Unexpected western raster edge after longitude normalisation: {transform[0]}Â°.")
+    else:
+        if size != GRID_SIZE:
+            raise ValueError(f"Expected the global 1440 x 721 grid, got {size}.")
+        if len(transform) != 6 or not all(isclose(a, b, abs_tol=1e-5) for a, b in zip(transform, GRID_TRANSFORM)):
+            raise ValueError(f"Unexpected GFS grid after longitude normalisation: {transform}")
 
     selected = {}
     timestamp = int(cycle.timestamp())
@@ -348,34 +366,32 @@ def arcpy_wind_array(arcpy, gdal, np, path, component):
 
     with gdal.OpenEx(str(tiff), gdal.OF_RASTER, allowed_drivers=["GTiff"]) as raster:
         shape = [raster.RasterXSize, raster.RasterYSize]
-        if shape != GRID_SIZE or raster.RasterCount != 1:
-            raise WindInputError(f"ArcGIS copied {component} as {shape} with {raster.RasterCount} bands; expected {GRID_SIZE} with one band.")
+        if raster.RasterCount != 1:
+            raise WindInputError(f"ArcGIS copied {component} with {raster.RasterCount} bands; expected one.")
         transform = raster.GetGeoTransform(can_return_null=True)
-        if transform is None:
-            raise WindInputError(f"ArcGIS copied {component} without a geographic grid transform.")
+        try:
+            validate_exported_grid(shape, transform)
+        except ValueError as error:
+            raise WindInputError(f"ArcGIS copy of {component}: {error}") from error
+        width, height = shape
         x0, dx, rx, y0, ry, dy = transform
         band = raster.GetRasterBand(1)
         try:
             nodata = band.GetNoDataValue()
-            samples = band.ReadRaster(0, 0, *GRID_SIZE, buf_type=gdal.GDT_Float32)
+            samples = band.ReadRaster(0, 0, width, height, buf_type=gdal.GDT_Float32)
         finally:
             del band
 
-    longitude, latitude = x0 + dx / 2, y0 + dy / 2
-    if not all(isclose(actual, expected, abs_tol=1e-5)
-               for actual, expected in ((dx, 0.25), (dy, -0.25), (rx, 0), (ry, 0), (latitude, 90.0))):
-        raise WindInputError(f"ArcGIS copied {component} with an unexpected grid transform: {transform}.")
-    columns = (-180.0 - longitude) / dx
-    if not isclose(columns, round(columns), abs_tol=1e-4):
-        raise WindInputError(f"ArcGIS read {component} with a misaligned longitude grid starting at {longitude}Â°.")
-
-    values = np.frombuffer(samples, dtype=np.float32).reshape(GRID_SIZE[1], GRID_SIZE[0])
+    values = np.frombuffer(samples, dtype=np.float32).reshape(height, width)
     invalid = ~np.isfinite(values)
     if nodata is not None:
         invalid |= values == np.float32(nodata)
     if invalid.any():
         values = np.where(invalid, np.float32(WIND_NODATA), values)
-    return np.roll(values, -round(columns) % GRID_SIZE[0], axis=1)
+    # Move the seam by whole columns and keep the ArcGIS latitude coordinates.
+    shift = floor((x0 + 180.0) / dx + 0.5 + 1e-8)
+    normalized = (x0 - shift * dx, dx, rx, y0 - shift * ry, ry, dy)
+    return np.roll(values, shift % width, axis=1), normalized
 
 
 def convert_grib_with_arcpy(gdal, grib, output, cycle):
@@ -392,20 +408,30 @@ def convert_grib_with_arcpy(gdal, grib, output, cycle):
                 path.write_bytes(fields[component])
                 arrays.append(arcpy_wind_array(arcpy, gdal, np, path, component))
 
+    (u_values, transform), (v_values, v_transform) = arrays
+    if u_values.shape != v_values.shape or not all(
+        isclose(u, v, abs_tol=1e-8) for u, v in zip(transform, v_transform)
+    ):
+        raise WindInputError(
+            f"ArcGIS produced different U/V grids: U {u_values.shape} {transform}, "
+            f"V {v_values.shape} {v_transform}."
+        )
+
+    height, width = u_values.shape
     timestamp = str(int(cycle.timestamp()))
     with gdal.GetDriverByName("GTiff").Create(
-        str(output), *GRID_SIZE, 2, gdal.GDT_Float32, options=["COMPRESS=DEFLATE"],
+        str(output), width, height, 2, gdal.GDT_Float32, options=["COMPRESS=DEFLATE"],
     ) as raster:
-        raster.SetGeoTransform(GRID_TRANSFORM)
+        raster.SetGeoTransform(transform)
         spatial_reference = osr.SpatialReference()
         spatial_reference.ImportFromEPSG(4326)
         raster.SetSpatialRef(spatial_reference)
-        for index, (component, values) in enumerate(zip(("UGRD", "VGRD"), arrays), start=1):
+        for index, (component, values) in enumerate((("UGRD", u_values), ("VGRD", v_values)), start=1):
             band = raster.GetRasterBand(index)
             band.SetNoDataValue(WIND_NODATA)
             band.SetMetadata({"GRIB_ELEMENT": component, "GRIB_SHORT_NAME": "10-HTGL",
                               "GRIB_REF_TIME": timestamp, "GRIB_VALID_TIME": timestamp})
-            band.WriteRaster(0, 0, *GRID_SIZE, values.tobytes(), buf_type=gdal.GDT_Float32)
+            band.WriteRaster(0, 0, width, height, values.tobytes(), buf_type=gdal.GDT_Float32)
             del band
 
 
@@ -414,7 +440,7 @@ def verify_tiff(gdal, path, cycle):
         with gdal.OpenEx(str(path), gdal.OF_RASTER, allowed_drivers=["GTiff"]) as dataset:
             info = read_raster_info(gdal, dataset)
         types = [band["type"] for band in info["bands"]]
-        if wind_bands(info, cycle) != (1, 2) or types != ["Float32", "Float32"]:
+        if wind_bands(info, cycle, exported=True) != (1, 2) or types != ["Float32", "Float32"]:
             raise ValueError("Expected two Float32 bands ordered U, V.")
     except (RuntimeError, ValueError) as error:
         raise ValueError(f"GeoTIFF {path}: {error}") from error
