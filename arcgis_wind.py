@@ -86,6 +86,50 @@ def archive_ranges(index_text):
         yield start, next_offsets.get(start)
 
 
+def stream_bytes(response, size, output=None):
+    while size:
+        chunk = response.read(min(size, 1024 * 1024))
+        if not chunk:
+            raise WindInputError("The NOAA archive response ended before all requested bytes arrived.")
+        if output is not None:
+            output.write(chunk)
+        size -= len(chunk)
+
+
+def write_grib_record(response, output, header, expected_size):
+    if len(header) != 16 or header[:4] != b"GRIB" or header[7] != 2:
+        raise WindInputError("The NOAA archive did not contain a GRIB2 record at an indexed offset.")
+    size = int.from_bytes(header[8:16], "big")
+    if size < 20 or (expected_size is not None and size != expected_size):
+        raise WindInputError("A NOAA GRIB2 record length did not match the archive index.")
+
+    output.write(header)
+    stream_bytes(response, size - 20, output)
+    trailer = response.read(4)
+    if trailer != b"7777":
+        raise WindInputError("A NOAA GRIB2 record was incomplete or missing its end marker.")
+    output.write(trailer)
+    return size
+
+
+def extract_full_archive(response, output, ranges):
+    first_header = response.read(16)
+    if len(first_header) != 16 or first_header[:4] != b"GRIB" or first_header[7] != 2:
+        raise WindInputError("The response body did not start with a GRIB2 file.")
+
+    position = len(first_header)
+    for start, next_start in ranges:
+        if start == 0:
+            header = first_header
+        else:
+            if start < position:
+                raise WindInputError("The NOAA archive index points inside a previous GRIB2 record.")
+            stream_bytes(response, start - position)
+            header = response.read(16)
+        expected_size = next_start - start if next_start is not None else None
+        position = start + write_grib_record(response, output, header, expected_size)
+
+
 def download_archive_grib(cycle, destination):
     key = cycle.strftime("gfs.%Y%m%d/%H/atmos/gfs.t%Hz.pgrb2.0p25.f000")
     url = f"{GFS_ARCHIVE}/{key}"
@@ -96,20 +140,29 @@ def download_archive_grib(cycle, destination):
         for start, next_start in ranges:
             end = next_start - 1 if next_start is not None else None
             range_end = str(end) if end is not None else ""
-            request = Request(url, headers={"Range": f"bytes={start}-{range_end}"})
+            request = Request(url, headers={"Range": f"bytes={start}-{range_end}", "Accept-Encoding": "identity"})
             with urlopen(request, timeout=60) as response:
-                if response.status != 206:
-                    raise WindInputError("The NOAA archive did not return the requested byte range (HTTP 206).")
-                returned = re.fullmatch(r"bytes (\d+)-(\d+)/(\d+)", response.headers.get("Content-Range", ""))
+                content_range = response.headers.get("Content-Range", "")
+                if response.status == 200 and not content_range:
+                    # Start over if an earlier partial response already supplied one record.
+                    output.seek(0)
+                    output.truncate()
+                    try:
+                        extract_full_archive(response, output, ranges)
+                    except WindInputError as error:
+                        raise WindInputError(f"The NOAA archive returned HTTP 200 to a Range request. {error}") from error
+                    return
+                if response.status not in (200, 206):
+                    raise WindInputError(f"Unexpected HTTP {response.status} from the NOAA archive for a Range request.")
+
+                returned = re.fullmatch(r"bytes (\d+)-(\d+)/(\d+)", content_range)
                 if returned is None:
                     raise WindInputError("The NOAA archive response is missing a valid Content-Range header.")
                 actual_start, actual_end, total = map(int, returned.groups())
-                if actual_start != start or actual_end != (end if end is not None else total - 1):
+                if (actual_start != start or actual_end != (end if end is not None else total - 1)
+                        or not actual_start <= actual_end < total):
                     raise WindInputError("The NOAA archive returned a different byte range than requested.")
-                record = response.read()
-                if not record.startswith(b"GRIB") or len(record) != actual_end - actual_start + 1:
-                    raise WindInputError("The NOAA archive returned an invalid or incomplete GRIB2 record.")
-                output.write(record)
+                write_grib_record(response, output, response.read(16), actual_end - actual_start + 1)
 
 
 def grib_header_size(path):
