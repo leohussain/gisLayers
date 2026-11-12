@@ -228,8 +228,8 @@ def read_raster_info(gdal, dataset):
 
 def verify_tiff(gdal, path, cycle):
     try:
-        dataset = gdal.OpenEx(str(path), gdal.OF_RASTER, allowed_drivers=["GTiff"])
-        info = read_raster_info(gdal, dataset)
+        with gdal.OpenEx(str(path), gdal.OF_RASTER, allowed_drivers=["GTiff"]) as dataset:
+            info = read_raster_info(gdal, dataset)
         types = [band["type"] for band in info["bands"]]
         if wind_bands(info, cycle) != (1, 2) or types != ["Float32", "Float32"]:
             raise ValueError("Expected two Float32 bands ordered U, V.")
@@ -239,18 +239,22 @@ def verify_tiff(gdal, path, cycle):
 
 def convert_grib(gdal, grib, output, cycle):
     with gdal.ExceptionMgr(), gdal.config_option("GRIB_ADJUST_LONGITUDE_RANGE", "YES"):
+        input_valid = False
         try:
-            source = gdal.OpenEx(str(grib), gdal.OF_RASTER, allowed_drivers=["GRIB"])
-            u_band, v_band = wind_bands(read_raster_info(gdal, source), cycle)
+            with gdal.OpenEx(str(grib), gdal.OF_RASTER, allowed_drivers=["GRIB"]) as source:
+                u_band, v_band = wind_bands(read_raster_info(gdal, source), cycle)
+                input_valid = True
+                with gdal.Translate(
+                    str(output), source, format="GTiff",
+                    bandList=[u_band, v_band], outputType=gdal.GDT_Float32,
+                    outputSRS="EPSG:4326", creationOptions=["COMPRESS=DEFLATE"],
+                ):
+                    pass  # Close the output before checking it or passing it to ArcPy.
         except (RuntimeError, ValueError) as error:
+            if input_valid:
+                raise
             header_size = grib_header_size(grib) if grib.is_file() else None
             raise WindInputError(f"Input GRIB2 {grib.name} (raw grid: {header_size}): {error}") from error
-        raster = gdal.Translate(
-            str(output), source, format="GTiff",
-            bandList=[u_band, v_band], outputType=gdal.GDT_Float32,
-            outputSRS="EPSG:4326", creationOptions=["COMPRESS=DEFLATE"],
-        )
-        raster = None  # Close and flush GDAL's output before ArcPy opens it.
         verify_tiff(gdal, output, cycle)
 
 
@@ -264,8 +268,9 @@ def fetch_global_wind(arcpy, gdal, cycle, grib, output):
             raise
         arcpy.AddWarning(f"NOMADS {cycle.isoformat()}: {error} Trying NOAA's Open Data archive.")
 
-    download_archive_grib(cycle, grib)
-    convert_grib(gdal, grib, output, cycle)
+    archive_grib = grib.with_stem(f"{grib.stem}_archive")
+    download_archive_grib(cycle, archive_grib)
+    convert_grib(gdal, archive_grib, output, cycle)
 
 
 def prepare_wind(output_dir, *, cycle=None, grib_file=None):
