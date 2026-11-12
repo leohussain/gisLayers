@@ -28,6 +28,8 @@ SHARING_GROUPS = ""  # Comma-separated Portal group names, if needed.
 NOMADS = "https://nomads.ncep.noaa.gov/cgi-bin/filter_gfs_0p25.pl"
 GFS_ARCHIVE = "https://noaa-gfs-bdp-pds.s3.amazonaws.com"
 GRID_SIZE = [1440, 721]
+GRID_TRANSFORM = (-180.125, 0.25, 0.0, 90.125, 0.0, -0.25)
+WIND_NODATA = -9999.0
 
 
 class WindInputError(ValueError):
@@ -222,8 +224,149 @@ def wind_bands(info, cycle):
 
 
 def read_raster_info(gdal, dataset):
-    info = gdal.Info(dataset, format="json")
-    return json.loads(info) if isinstance(info, str) else info
+    bands = []
+    for index in range(1, dataset.RasterCount + 1):
+        band = dataset.GetRasterBand(index)
+        bands.append({
+            "band": index,
+            "type": gdal.GetDataTypeName(band.DataType),
+            "metadata": {"": band.GetMetadata()},
+        })
+    return {
+        "size": [dataset.RasterXSize, dataset.RasterYSize],
+        "geoTransform": dataset.GetGeoTransform(can_return_null=True) or (),
+        "bands": bands,
+    }
+
+
+def grib_sections(message):
+    offset = 0
+    while offset < len(message):
+        length = int.from_bytes(message[offset:offset + 4], "big")
+        if length < 5 or offset + length > len(message):
+            raise WindInputError("Invalid GRIB2 section length in the downloaded file.")
+        section = message[offset:offset + length]
+        yield section[4], section
+        offset += length
+
+
+def native_wind_messages(path, cycle):
+    """Extract standalone U/V fields for the ArcGIS reader, including shared-grid messages."""
+    wind = {}
+    with path.open("rb") as stream:
+        while header := stream.read(16):
+            size = int.from_bytes(header[8:16], "big")
+            if len(header) != 16 or header[:4] != b"GRIB" or header[7] != 2 or size < 20:
+                raise WindInputError(f"{path.name} does not contain complete GRIB2 messages.")
+            message = stream.read(size - 16)
+            if len(message) != size - 16 or message[-4:] != b"7777":
+                raise WindInputError(f"A GRIB2 message in {path.name} is incomplete.")
+            if header[6] != 0:  # Meteorological discipline.
+                continue
+
+            shared, field = {}, {}
+            previous_bitmap = None
+            for number, section in grib_sections(message[:-4]):
+                if number <= 3:
+                    shared[number] = section
+                    continue
+                field[number] = section
+                if number == 6 and len(section) > 5 and section[5] not in (254, 255):
+                    previous_bitmap = section
+                if number != 7:
+                    continue
+
+                product = field.get(4, b"")
+                identification = shared.get(1, b"")
+                grid = shared.get(3, b"")
+                if len(product) >= 34 and len(identification) >= 19 and len(grid) >= 38:
+                    parameter = product[10]
+                    height_scale = product[23]
+                    if height_scale & 128:
+                        height_scale = -(height_scale & 127)
+                    height = int.from_bytes(product[24:28], "big") * 10.0 ** (-height_scale)
+                    reference = (int.from_bytes(identification[12:14], "big"), *identification[14:19])
+                    matches_cycle = reference == (cycle.year, cycle.month, cycle.day, cycle.hour, 0, 0)
+                    if (product[7:9] == b"\0\0" and product[9] == 2 and parameter in (2, 3)
+                            and product[18:22] == b"\0\0\0\0" and product[22] == 103
+                            and height == 10 and matches_cycle):
+                        component = "UGRD" if parameter == 2 else "VGRD"
+                        shape = [int.from_bytes(grid[i:i + 4], "big") for i in (30, 34)]
+                        if grid[12:14] != b"\0\0" or shape != GRID_SIZE:
+                            raise WindInputError(f"{component} has GRIB2 grid {shape}; expected the global 0.25Â° grid.")
+                        if component in wind:
+                            raise WindInputError(f"Found more than one 10 m {component} field for this model cycle.")
+                        if not all(key in field for key in (5, 6, 7)) or len(field[6]) < 6:
+                            raise WindInputError(f"The GRIB2 sections for {component} are incomplete.")
+                        bitmap = field[6] if field[6][5] != 254 else previous_bitmap
+                        if bitmap is None:
+                            raise WindInputError(f"The shared GRIB2 bitmap for {component} is missing.")
+                        body = b"".join((identification, shared.get(2, b""), grid,
+                                         product, field[5], bitmap, field[7], b"7777"))
+                        wind[component] = header[:8] + (16 + len(body)).to_bytes(8, "big") + body
+                field.clear()
+
+    if set(wind) != {"UGRD", "VGRD"}:
+        raise WindInputError(f"{path.name} lacks a 10 m above-ground U/V analysis pair for {cycle.isoformat()}.")
+    return wind
+
+
+def arcpy_wind_array(arcpy, np, path, component):
+    layer = arcpy.md.MakeMultidimensionalRasterLayer(
+        str(path), f"wind_{component.lower()}_{uuid4().hex}", dimensionless="NO_DIMENSIONS",
+    ).getOutput(0)
+    try:
+        raster = arcpy.Raster(layer)
+        try:
+            values = np.asarray(arcpy.RasterToNumPyArray(raster, nodata_to_value=WIND_NODATA),
+                                dtype=np.float32).squeeze()
+            dx, dy = raster.meanCellWidth, raster.meanCellHeight
+            longitude = raster.extent.XMin + dx / 2
+            latitude = raster.extent.YMax - dy / 2
+        finally:
+            del raster
+    finally:
+        arcpy.management.Delete(layer)
+    if values.shape != (GRID_SIZE[1], GRID_SIZE[0]):
+        raise WindInputError(f"ArcGIS read {component} as {values.shape} rows/columns; expected (721, 1440).")
+    if not all(isclose(actual, expected, abs_tol=1e-5)
+               for actual, expected in ((dx, 0.25), (dy, 0.25), (latitude, 90.0))):
+        raise WindInputError(f"ArcGIS read an unexpected {component} cell size or latitude extent.")
+    columns = (-180.0 - longitude) / dx
+    if not isclose(columns, round(columns), abs_tol=1e-4):
+        raise WindInputError(f"ArcGIS read {component} with a misaligned longitude grid starting at {longitude}Â°.")
+    return np.roll(values, -round(columns) % GRID_SIZE[0], axis=1)
+
+
+def convert_grib_with_arcpy(gdal, grib, output, cycle):
+    import arcpy
+    import numpy as np
+    from osgeo import osr
+
+    fields = native_wind_messages(grib, cycle)
+    with TemporaryDirectory(prefix="wind-native-", dir=output.parent) as folder:
+        with arcpy.EnvManager(addOutputsToMap=False):
+            arrays = []
+            for component in ("UGRD", "VGRD"):
+                path = Path(folder) / f"{component}.grb2"
+                path.write_bytes(fields[component])
+                arrays.append(arcpy_wind_array(arcpy, np, path, component))
+
+    timestamp = str(int(cycle.timestamp()))
+    with gdal.GetDriverByName("GTiff").Create(
+        str(output), *GRID_SIZE, 2, gdal.GDT_Float32, options=["COMPRESS=DEFLATE"],
+    ) as raster:
+        raster.SetGeoTransform(GRID_TRANSFORM)
+        spatial_reference = osr.SpatialReference()
+        spatial_reference.ImportFromEPSG(4326)
+        raster.SetSpatialRef(spatial_reference)
+        for index, (component, values) in enumerate(zip(("UGRD", "VGRD"), arrays), start=1):
+            band = raster.GetRasterBand(index)
+            band.SetNoDataValue(WIND_NODATA)
+            band.SetMetadata({"GRIB_ELEMENT": component, "GRIB_SHORT_NAME": "10-HTGL",
+                              "GRIB_REF_TIME": timestamp, "GRIB_VALID_TIME": timestamp})
+            band.WriteRaster(0, 0, *GRID_SIZE, values.tobytes(), buf_type=gdal.GDT_Float32)
+            del band
 
 
 def verify_tiff(gdal, path, cycle):
@@ -254,7 +397,15 @@ def convert_grib(gdal, grib, output, cycle):
             if input_valid:
                 raise
             header_size = grib_header_size(grib) if grib.is_file() else None
-            raise WindInputError(f"Input GRIB2 {grib.name} (raw grid: {header_size}): {error}") from error
+            detail = f"Input GRIB2 {grib.name} (raw grid: {header_size}): {error}"
+            if header_size != GRID_SIZE:
+                raise WindInputError(detail) from error
+            import arcpy
+            arcpy.AddWarning(f"{detail} Trying the ArcGIS Pro GRIB reader.")
+            try:
+                convert_grib_with_arcpy(gdal, grib, output, cycle)
+            except (arcpy.ExecuteError, RuntimeError, ValueError, OSError) as native_error:
+                raise WindInputError(f"{detail} ArcGIS Pro reader: {native_error}") from native_error
         verify_tiff(gdal, output, cycle)
 
 
