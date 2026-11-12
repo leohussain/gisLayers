@@ -3,171 +3,69 @@ https://nomads.ncep.noaa.gov/cgi-bin/filter_gfs_0p25.pl?file=gfs.t00z.pgrb2.0p25
 
 ---------------------------------------------------------------------------
 ValueError                                Traceback (most recent call last)
-Cell In[6], line 388, in convert_grib(gdal, grib, output, cycle)
-    387 with gdal.OpenEx(str(grib), gdal.OF_RASTER, allowed_drivers=["GRIB"]) as source:
---> 388     u_band, v_band = wind_bands(read_raster_info(gdal, source), cycle)
-    389     input_valid = True
+Cell In[7], line 427, in convert_grib(gdal, grib, output, cycle)
+    426 with gdal.OpenEx(str(grib), gdal.OF_RASTER, allowed_drivers=["GRIB"]) as source:
+--> 427     u_band, v_band = wind_bands(read_raster_info(gdal, source), cycle)
+    428     input_valid = True
 
-Cell In[6], line 196, in wind_bands(info, cycle)
-    195 if info.get("size") != GRID_SIZE:
---> 196     raise ValueError(f"Expected the global 1440 x 721 grid, got {info.get('size')}.")
-    198 transform = info.get("geoTransform", [])
+Cell In[7], line 197, in wind_bands(info, cycle)
+    196 if info.get("size") != GRID_SIZE:
+--> 197     raise ValueError(f"Expected the global 1440 x 721 grid, got {info.get('size')}.")
+    199 transform = info.get("geoTransform", [])
 
 ValueError: Expected the global 1440 x 721 grid, got [512, 512].
 
 During handling of the above exception, another exception occurred:
 
-TypeError                                 Traceback (most recent call last)
-Cell In[6], line 353, in convert_grib_with_arcpy(gdal, grib, output, cycle)
-    352             path.write_bytes(fields[component])
---> 353             arrays.append(arcpy_wind_array(arcpy, np, path, component))
-    355 timestamp = str(int(cycle.timestamp()))
+WindInputError                            Traceback (most recent call last)
+Cell In[7], line 445, in convert_grib(gdal, grib, output, cycle)
+    444 try:
+--> 445     convert_grib_with_arcpy(gdal, grib, output, cycle)
+    446 except (arcpy.ExecuteError, RuntimeError, TypeError, ValueError, OSError) as native_error:
 
-Cell In[6], line 319, in arcpy_wind_array(arcpy, np, path, component)
-    318 try:
---> 319     raster = arcpy.Raster(layer)
-    320     try:
+Cell In[7], line 392, in convert_grib_with_arcpy(gdal, grib, output, cycle)
+    391             path.write_bytes(fields[component])
+--> 392             arrays.append(arcpy_wind_array(arcpy, gdal, np, path, component))
+    394 timestamp = str(int(cycle.timestamp()))
 
-File C:\Program Files\ArcGIS\Pro\Resources\ArcPy\arcpy\sa\Raster.py:82, in Raster.__new__(cls, in_raster, is_multidimensional)
-     81 def __new__(cls, in_raster, is_multidimensional=False):
----> 82     return super().__new__(cls, in_raster, is_multidimensional)
+Cell In[7], line 351, in arcpy_wind_array(arcpy, gdal, np, path, component)
+    350 if shape != GRID_SIZE or raster.RasterCount != 1:
+--> 351     raise WindInputError(f"ArcGIS copied {component} as {shape} with {raster.RasterCount} bands; expected {GRID_SIZE} with one band.")
+    352 transform = raster.GetGeoTransform(can_return_null=True)
 
-TypeError: expected a raster or layer name
-
-During handling of the above exception, another exception occurred:
-
-PermissionError                           Traceback (most recent call last)
-File C:\Program Files\ArcGIS\Pro\bin\Python\envs\arcgispro-py3\Lib\shutil.py:625, in _rmtree_unsafe(path, onexc)
-    624 try:
---> 625     os.unlink(fullname)
-    626 except FileNotFoundError:
-
-PermissionError: [WinError 32] The process cannot access the file because it is being used by another process: 'C:\\GIS\\Wind\\gfs-stage-dpo1he6e\\wind-native-t9jm9a77\\UGRD.grb2'
-
-During handling of the above exception, another exception occurred:
-
-PermissionError                           Traceback (most recent call last)
-Cell In[6], line 406, in convert_grib(gdal, grib, output, cycle)
-    405 try:
---> 406     convert_grib_with_arcpy(gdal, grib, output, cycle)
-    407 except (arcpy.ExecuteError, RuntimeError, ValueError, OSError) as native_error:
-
-Cell In[6], line 347, in convert_grib_with_arcpy(gdal, grib, output, cycle)
-    346 fields = native_wind_messages(grib, cycle)
---> 347 with TemporaryDirectory(prefix="wind-native-", dir=output.parent) as folder:
-    348     with arcpy.EnvManager(addOutputsToMap=False):
-
-File C:\Program Files\ArcGIS\Pro\bin\Python\envs\arcgispro-py3\Lib\tempfile.py:951, in TemporaryDirectory.__exit__(self, exc, value, tb)
-    950 if self._delete:
---> 951     self.cleanup()
-
-File C:\Program Files\ArcGIS\Pro\bin\Python\envs\arcgispro-py3\Lib\tempfile.py:955, in TemporaryDirectory.cleanup(self)
-    954 if self._finalizer.detach() or _os.path.exists(self.name):
---> 955     self._rmtree(self.name, ignore_errors=self._ignore_cleanup_errors)
-
-File C:\Program Files\ArcGIS\Pro\bin\Python\envs\arcgispro-py3\Lib\tempfile.py:935, in TemporaryDirectory._rmtree(cls, name, ignore_errors, repeated)
-    933             raise
---> 935 _shutil.rmtree(name, onexc=onexc)
-
-File C:\Program Files\ArcGIS\Pro\bin\Python\envs\arcgispro-py3\Lib\shutil.py:790, in rmtree(path, ignore_errors, onerror, onexc, dir_fd)
-    789     return
---> 790 return _rmtree_unsafe(path, onexc)
-
-File C:\Program Files\ArcGIS\Pro\bin\Python\envs\arcgispro-py3\Lib\shutil.py:629, in _rmtree_unsafe(path, onexc)
-    628         except OSError as err:
---> 629             onexc(os.unlink, fullname, err)
-    630 try:
-
-File C:\Program Files\ArcGIS\Pro\bin\Python\envs\arcgispro-py3\Lib\tempfile.py:910, in TemporaryDirectory._rmtree.<locals>.onexc(func, path, exc)
-    909 try:
---> 910     _os.unlink(path)
-    911 except IsADirectoryError:
-
-PermissionError: [WinError 32] The process cannot access the file because it is being used by another process: 'C:\\GIS\\Wind\\gfs-stage-dpo1he6e\\wind-native-t9jm9a77\\UGRD.grb2'
+WindInputError: ArcGIS copied UGRD as [1440, 720] with 1 bands; expected [1440, 721] with one band.
 
 The above exception was the direct cause of the following exception:
 
 WindInputError                            Traceback (most recent call last)
-Cell In[6], line 471, in prepare_wind(output_dir, cycle, grib_file)
-    470 try:
---> 471     fetch_global_wind(arcpy, gdal, model_time, grib, staged_tif)
-    472 except HTTPError as error:
+Cell In[7], line 634
+    630     return raster
+    633 if __name__ == "__main__":
+--> 634     run()
 
-Cell In[6], line 424, in fetch_global_wind(arcpy, gdal, cycle, grib, output)
-    423 download_archive_grib(cycle, archive_grib)
---> 424 convert_grib(gdal, archive_grib, output, cycle)
+Cell In[7], line 621, in run()
+    618 """Entry point for an ArcGIS Pro script tool."""
+    619 import arcpy
+--> 621 raster, valid_time = prepare_wind(OUTPUT_DIR)
+    622 arcpy.AddMessage(f"Raster: {raster}")
+    623 arcpy.AddMessage(f"Model valid time: {valid_time.isoformat()}")
 
-Cell In[6], line 408, in convert_grib(gdal, grib, output, cycle)
-    407     except (arcpy.ExecuteError, RuntimeError, ValueError, OSError) as native_error:
---> 408         raise WindInputError(f"{detail} ArcGIS Pro reader: {native_error}") from native_error
-    409 verify_tiff(gdal, output, cycle)
+Cell In[7], line 509, in prepare_wind(output_dir, cycle, grib_file)
+    507 arcpy.AddMessage(f"Checking NOAA GFS {model_time.isoformat()}")
+    508 try:
+--> 509     fetch_global_wind(arcpy, gdal, model_time, grib, staged_tif)
+    510 except HTTPError as error:
+    511     if error.code != 404 or index == len(cycles) - 1:
 
-WindInputError: Input GRIB2 wind_archive.grib2 (raw grid: [1440, 721]): Expected the global 1440 x 721 grid, got [512, 512]. ArcGIS Pro reader: [WinError 32] The process cannot access the file because it is being used by another process: 'C:\\GIS\\Wind\\gfs-stage-dpo1he6e\\wind-native-t9jm9a77\\UGRD.grb2'
+Cell In[7], line 463, in fetch_global_wind(arcpy, gdal, cycle, grib, output)
+    461 archive_grib = grib.with_stem(f"{grib.stem}_archive")
+    462 download_archive_grib(cycle, archive_grib)
+--> 463 convert_grib(gdal, archive_grib, output, cycle)
 
-During handling of the above exception, another exception occurred:
+Cell In[7], line 447, in convert_grib(gdal, grib, output, cycle)
+    445         convert_grib_with_arcpy(gdal, grib, output, cycle)
+    446     except (arcpy.ExecuteError, RuntimeError, TypeError, ValueError, OSError) as native_error:
+--> 447         raise WindInputError(f"{detail} ArcGIS Pro reader: {native_error}") from native_error
+    448 verify_tiff(gdal, output, cycle)
 
-PermissionError                           Traceback (most recent call last)
-File C:\Program Files\ArcGIS\Pro\bin\Python\envs\arcgispro-py3\Lib\shutil.py:625, in _rmtree_unsafe(path, onexc)
-    624 try:
---> 625     os.unlink(fullname)
-    626 except FileNotFoundError:
-
-PermissionError: [WinError 32] The process cannot access the file because it is being used by another process: 'C:\\GIS\\Wind\\gfs-stage-dpo1he6e\\wind-native-t9jm9a77\\UGRD.grb2'
-
-During handling of the above exception, another exception occurred:
-
-PermissionError                           Traceback (most recent call last)
-Cell In[6], line 596
-    592     return raster
-    595 if __name__ == "__main__":
---> 596     run()
-
-Cell In[6], line 583, in run()
-    580 """Entry point for an ArcGIS Pro script tool."""
-    581 import arcpy
---> 583 raster, valid_time = prepare_wind(OUTPUT_DIR)
-    584 arcpy.AddMessage(f"Raster: {raster}")
-    585 arcpy.AddMessage(f"Model valid time: {valid_time.isoformat()}")
-
-Cell In[6], line 462, in prepare_wind(output_dir, cycle, grib_file)
-    459             verify_tiff(gdal, output, model_time)
-    460         return output, model_time
---> 462 with TemporaryDirectory(prefix="gfs-stage-", dir=output_dir) as temp_dir:
-    463     stage = Path(temp_dir)
-    464     grib = Path(grib_file) if grib_file else stage / "wind.grib2"
-
-File C:\Program Files\ArcGIS\Pro\bin\Python\envs\arcgispro-py3\Lib\tempfile.py:951, in TemporaryDirectory.__exit__(self, exc, value, tb)
-    949 def __exit__(self, exc, value, tb):
-    950     if self._delete:
---> 951         self.cleanup()
-
-File C:\Program Files\ArcGIS\Pro\bin\Python\envs\arcgispro-py3\Lib\tempfile.py:955, in TemporaryDirectory.cleanup(self)
-    953 def cleanup(self):
-    954     if self._finalizer.detach() or _os.path.exists(self.name):
---> 955         self._rmtree(self.name, ignore_errors=self._ignore_cleanup_errors)
-
-File C:\Program Files\ArcGIS\Pro\bin\Python\envs\arcgispro-py3\Lib\tempfile.py:935, in TemporaryDirectory._rmtree(cls, name, ignore_errors, repeated)
-    932         if not ignore_errors:
-    933             raise
---> 935 _shutil.rmtree(name, onexc=onexc)
-
-File C:\Program Files\ArcGIS\Pro\bin\Python\envs\arcgispro-py3\Lib\shutil.py:790, in rmtree(path, ignore_errors, onerror, onexc, dir_fd)
-    788     # can't continue even if onexc hook returns
-    789     return
---> 790 return _rmtree_unsafe(path, onexc)
-
-File C:\Program Files\ArcGIS\Pro\bin\Python\envs\arcgispro-py3\Lib\shutil.py:629, in _rmtree_unsafe(path, onexc)
-    627             continue
-    628         except OSError as err:
---> 629             onexc(os.unlink, fullname, err)
-    630 try:
-    631     os.rmdir(path)
-
-File C:\Program Files\ArcGIS\Pro\bin\Python\envs\arcgispro-py3\Lib\tempfile.py:910, in TemporaryDirectory._rmtree.<locals>.onexc(func, path, exc)
-    907 _resetperms(path)
-    909 try:
---> 910     _os.unlink(path)
-    911 except IsADirectoryError:
-    912     cls._rmtree(path, ignore_errors=ignore_errors)
-
-PermissionError: [WinError 32] The process cannot access the file because it is being used by another process: 'C:\\GIS\\Wind\\gfs-stage-dpo1he6e\\wind-native-t9jm9a77\\UGRD.grb2'
+WindInputError: Input GRIB2 wind_archive.grib2 (raw grid: [1440, 721]): Expected the global 1440 x 721 grid, got [512, 512]. ArcGIS Pro reader: ArcGIS copied UGRD as [1440, 720] with 1 bands; expected [1440, 721] with one band.
